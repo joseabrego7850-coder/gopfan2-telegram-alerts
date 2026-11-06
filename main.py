@@ -24,7 +24,15 @@ def get_activity(cursor=None):
         params["cursor"] = cursor
 
     url = API + "?" + urllib.parse.urlencode(params)
-    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+    req = urllib.request.Request(
+    url,
+    headers={
+        "Accept": "application/json",
+        "User-Agent": "gopfan2-public-monitor/1.0",
+        "Origin": "https://polymarket.com",
+        "Referer": "https://polymarket.com/"
+    }
+)
 
     with urllib.request.urlopen(req, timeout=20) as response:
         result = json.loads(response.read())
@@ -163,7 +171,9 @@ def main():
                 delay = max(float(delay), POLL_SECONDS)
             except ValueError:
                 delay = 10
-            print(f"API/HTTP error {error.code}; retrying in {delay}s")
+            body = error.read().decode("utf-8", "replace")[:1000]
+            trace_id = error.headers.get("x-trace-id") or error.headers.get("cf-ray") or "unavailable"
+            print(f"API/HTTP error {error.code}; trace={trace_id}; body={body}; retrying in {delay}s")
             time.sleep(delay)
 
         except Exception as error:
