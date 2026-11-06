@@ -1,72 +1,62 @@
 import os
 import time
 import json
+import hashlib
 import urllib.request
 import urllib.parse
+import urllib.error
 from datetime import datetime, timezone
 
 WALLET = "0xf2f6af4f27ec2dcf4072095ab804016e14cd5817"
 API = "https://data-api.polymarket.com/v2/activity"
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
-POLL_SECONDS = 2
 
+POLL_SECONDS = 2
+PAGE_SIZE = 1000
 seen = set()
 initialized = False
 
 
-def get_activity():
-    params = urllib.parse.urlencode({
-        "user": WALLET,
-        "limit": 100
-    })
-    req = urllib.request.Request(
-        API + "?" + params,
-        headers={"Accept": "application/json"}
-    )
-    with urllib.request.urlopen(req, timeout=15) as response:
+def get_activity(cursor=None):
+    params = {"user": WALLET, "limit": PAGE_SIZE}
+    if cursor:
+        params["cursor"] = cursor
+
+    url = API + "?" + urllib.parse.urlencode(params)
+    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+
+    with urllib.request.urlopen(req, timeout=20) as response:
         result = json.loads(response.read())
 
-    rows = result.get("data", [])
-    if isinstance(rows, dict):
-        rows = rows.get("items", [])
-    return rows if isinstance(rows, list) else []
-
-
-def field(item, *names, default=""):
-    for name in names:
-        value = item.get(name)
-        if value is not None:
-            return value
-    return default
+    rows = result.get("data") or []
+    pagination = result.get("pagination") or {}
+    return rows, pagination.get("next_cursor")
 
 
 def event_key(item):
-    identity = field(item, "id", "activity_id")
+    identity = item.get("id") or item.get("activity_id")
     if identity:
         return str(identity)
 
-    parts = [
-        field(item, "transaction_hash", "transactionHash", "tx_hash"),
-        field(item, "timestamp", "block_timestamp"),
-        field(item, "type", "activity_type"),
-        field(item, "asset", "token_id"),
-        field(item, "side"),
-        field(item, "price"),
-        field(item, "size", "shares")
-    ]
-    return "|".join(map(str, parts))
+    tx = item.get("transaction_hash") or item.get("transactionHash") or ""
+    sequence = item.get("sequence_id", "")
+    if tx and sequence != "":
+        return f"{tx}:{sequence}:{item.get('type', '')}"
+
+    raw = json.dumps(item, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode()).hexdigest()
 
 
 def telegram(message):
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     body = urllib.parse.urlencode({
         "chat_id": CHAT_ID,
-        "text": message
+        "text": message[:3900]
     }).encode()
 
     req = urllib.request.Request(url, data=body)
-    with urllib.request.urlopen(req, timeout=15) as response:
+    with urllib.request.urlopen(req, timeout=20) as response:
         result = json.loads(response.read())
 
     if not result.get("ok"):
@@ -74,11 +64,10 @@ def telegram(message):
 
 
 def describe(item):
-    kind = str(field(item, "type", "activity_type",
-                     default="UNKNOWN")).upper()
-    side = str(field(item, "side", default="")).upper()
+    kind = str(item.get("type") or "UNKNOWN").upper()
+    side = str(item.get("side") or "").upper()
 
-    timestamp = field(item, "timestamp", "block_timestamp")
+    timestamp = item.get("timestamp")
     try:
         date = datetime.fromtimestamp(
             float(timestamp), timezone.utc
@@ -86,17 +75,17 @@ def describe(item):
     except (ValueError, TypeError, OverflowError):
         date = "Timestamp unavailable"
 
-    market = field(
-        item, "title", "market", "market_title",
-        default="Market unavailable"
-    )
-    outcome = field(item, "outcome", default="Unknown")
-    price = field(item, "price", default=None)
-    shares = field(item, "size", "shares", default=None)
+    market = item.get("title") or item.get("market") or "Market unavailable"
+    outcome = item.get("outcome") or "Unknown"
+    price = item.get("price")
+    shares = item.get("size")
+    value = item.get("usdc_size")
+    slug = item.get("slug")
+    tx = item.get("transaction_hash") or item.get("transactionHash")
 
     lines = [
-        "GOPFAN2 PUBLIC ACTIVITY",
-        f"Action: {kind} {side}".strip(),
+        "GOPFAN2 — PUBLIC ACTIVITY",
+        f"Action: {kind}" + (f" / {side}" if side else ""),
         f"Market: {market}",
         f"Outcome: {outcome}",
         f"Time: {date}"
@@ -104,70 +93,78 @@ def describe(item):
 
     if price is not None:
         lines.append(f"Price: {price}")
-
     if shares is not None:
-        lines.append(f"Shares/quantity: {shares}")
-
-    notional = field(item, "usdc_size", "usdcSize", default=None)
-
-    if notional is not None:
-        lines.append(f"Reported USDC value: {notional}")
+        lines.append(f"Quantity: {shares}")
+    if value is not None:
+        lines.append(f"Reported USDC value: {value}")
     elif kind == "TRADE" and price is not None and shares is not None:
         try:
             lines.append(
-                f"Approximate trade notional: "
-                f"{float(price) * float(shares):.4f} USDC"
+                f"Approx. trade notional: {float(price) * float(shares):.4f} USDC"
             )
         except (ValueError, TypeError):
             pass
 
     if kind in ("REDEEM", "REDEMPTION"):
-        lines.append("Redemption is NOT automatically profit.")
+        lines.append("Note: redemption amount is not automatically profit.")
 
-    tx = field(
-        item, "transaction_hash", "transactionHash", "tx_hash"
-    )
+    if slug:
+        lines.append(f"Market link: https://polymarket.com/event/{slug}")
     if tx:
-        lines.append(f"Transaction: {tx}")
+        lines.append(f"Transaction: https://polygonscan.com/tx/{tx}")
 
-    lines.append(
-        "Public observation only. Possible signal, not a trade recommendation."
-    )
-    lines.append("No orders executed.")
-
+    lines.append("Public observation only. No orders executed.")
     return "\n".join(lines)
 
 
 def main():
     global initialized
 
-    telegram("gopfan2 monitor started. Public data only; no trading.")
+    telegram("gopfan2 monitor started. Public data only. No trading.")
+    print("Monitor started.")
 
     while True:
         try:
-            rows = get_activity()
+            cursor = None
+            new_items = []
 
-            if not initialized:
-                for item in rows:
-                    seen.add(event_key(item))
-                initialized = True
-                print(f"Initial baseline: {len(seen)} events")
-            else:
-                new_items = []
+            while True:
+                rows, next_cursor = get_activity(cursor)
+
+                if not initialized:
+                    for item in rows:
+                        seen.add(event_key(item))
+                    initialized = True
+                    print(f"Initial baseline: {len(seen)} events")
+                    break
+
+                found_known = False
+
                 for item in rows:
                     key = event_key(item)
-                    if key not in seen:
+                    if key in seen:
+                        found_known = True
+                    else:
                         seen.add(key)
                         new_items.append(item)
 
-                for item in reversed(new_items):
-                    telegram(describe(item))
-                    print("New activity alert sent")
+                if found_known or not next_cursor:
+                    break
 
-                if len(seen) > 10000:
-                    seen.clear()
-                    for item in rows:
-                        seen.add(event_key(item))
+                cursor = next_cursor
+
+            for item in reversed(new_items):
+                telegram(describe(item))
+                print("New activity alert sent.")
+
+        except urllib.error.HTTPError as error:
+            delay = error.headers.get("Retry-After", "10")
+            try:
+                delay = max(float(delay), POLL_SECONDS)
+            except ValueError:
+                delay = 10
+            print(f"API/HTTP error {error.code}; retrying in {delay}s")
+            time.sleep(delay)
 
         except Exception as error:
             print("Monitoring error:", str(error))
